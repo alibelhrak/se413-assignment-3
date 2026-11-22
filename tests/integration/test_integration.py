@@ -1,3 +1,8 @@
+"""Integration tests (Section 4).
+
+Real RegistrationRepository and RegistrationService on a real SQLite file;
+only the notifier is a test double (FakeNotifier in conftest.py).
+"""
 
 import sqlite3
 
@@ -97,7 +102,6 @@ def test_failed_transaction_leaves_neither_seat_nor_enrollment(connection, repos
         assert enrollment_count(other, "ST1", "CIS350") == 1
     finally:
         other.close()
-        
 
 
 # ---------------------------------------------------------------------------
@@ -158,3 +162,33 @@ def test_duplicate_enrollment_raises_already_enrolled_and_sends_nothing(service,
     assert seats_taken(connection, "CIS350") == 1        # no extra seat
     # notifier side: only the first enrollment's confirmation
     assert notifier.sent == [("confirmation", "ST1", "CIS350", 400.0)]
+
+
+# ---------------------------------------------------------------------------
+# Section 4(d): the known defect -- withdrawing (REQ-6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known defect: RegistrationRepository.remove_enrollment() deletes "
+           "WHERE course_code = ? without filtering on student_id, so one "
+           "student's withdrawal removes EVERY student's enrollment in that "
+           "course while release_seat() frees only one seat (violates REQ-6).",
+)
+def test_withdraw_removes_only_that_students_enrollment(service, connection):
+    """REQ-6: withdrawing frees exactly one seat and removes only that student's enrollment.
+
+    ST1 and ST2 are both enrolled in CIS350 (2 seats taken). ST1 withdraws.
+    Expected by REQ-6: ST1 gone, ST2 still enrolled, 1 seat taken.
+    Actual: both enrollments are deleted, yet seats_taken is 1 -- the seat
+    count no longer matches the enrollments table.
+    """
+    service.enroll("ST1", "CIS350")
+    service.enroll("ST2", "CIS350")
+    assert seats_taken(connection, "CIS350") == 2
+
+    service.withdraw("ST1", "CIS350")
+
+    assert enrollment_count(connection, "ST1", "CIS350") == 0   # ST1 removed
+    assert seats_taken(connection, "CIS350") == 1               # exactly one seat freed
+    assert enrollment_count(connection, "ST2", "CIS350") == 1   # FAILS: ST2 also deleted
