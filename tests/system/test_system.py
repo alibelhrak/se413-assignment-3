@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 import requests
 
@@ -162,3 +164,67 @@ def test_health_needs_no_api_key(system):
     response = requests.get(system.url + "/health", timeout=10)
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+    
+    
+
+
+# ---------------------------------------------------------------------------
+# Section 5(c): concurrency (REQ-2)
+# ---------------------------------------------------------------------------
+
+def test_ten_students_race_for_three_seats(system):
+    """REQ-2, REQ-5: SE499 has 3 seats; 10 eligible students (S01-S10) request it
+    at the same moment. Exactly 3 get in, 7 are told the course is full, and
+    the course is never over capacity.
+    """
+    students = [f"S{n:02d}" for n in range(1, 11)]
+    barrier = threading.Barrier(len(students))
+    results = {}          # student_id -> (status code, JSON body)
+    errors = []
+
+    def enroll(student_id):
+        try:
+            barrier.wait(timeout=10)          # all 10 threads are released together
+            # one plain request per thread (a requests.Session is not thread-safe)
+            response = requests.post(f"{system.url}/enrollments", timeout=30,
+                                     headers={"X-API-Key": "registrar-key"},
+                                     json={"student_id": student_id, "course_code": "SE499"})
+            results[student_id] = (response.status_code, response.json())
+        except Exception as exc:              # surface thread failures in the test
+            errors.append(f"{student_id}: {exc!r}")
+
+    threads = [threading.Thread(target=enroll, args=(s,)) for s in students]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    assert len(results) == 10
+
+    # exactly 3 x 201 and 7 x 409 "course is full"
+    statuses = sorted(code for code, _ in results.values())
+    assert statuses == [201] * 3 + [409] * 7
+    admitted = {s for s, (code, _) in results.items() if code == 201}
+    refused = {s for s, (code, _) in results.items() if code == 409}
+    for student_id in refused:
+        assert results[student_id][1] == {"error": "course is full"}
+
+    # the course is exactly full, never over capacity
+    assert seats_taken(system, "SE499") == 3
+
+    # outbox: 3 confirmations and 7 rejections, for exactly the right students
+    outbox = system.outbox()
+    confirmations = [m for m in outbox if m["type"] == "confirmation"]
+    rejections = [m for m in outbox if m["type"] == "rejection"]
+    assert len(outbox) == 10
+    assert len(confirmations) == 3 and len(rejections) == 7
+    assert {m["student_id"] for m in confirmations} == admitted
+    assert {m["student_id"] for m in rejections} == refused
+    assert all(m["course_code"] == "SE499" and m["fee"] == 300.0 for m in confirmations)
+    assert all(m["reason"] == "course is full" for m in rejections)
+
+    # each admitted student's schedule shows SE499
+    for student_id in admitted:
+        courses = system.get(f"/students/{student_id}/schedule").json()["courses"]
+        assert [c["code"] for c in courses] == ["SE499"]
